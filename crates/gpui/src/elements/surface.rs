@@ -14,12 +14,22 @@ pub enum SurfaceSource {
     /// A CoreVideo image buffer
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     Surface(CFRetained<CVPixelBuffer>),
+    /// An NV12 frame uploaded to the GPU as two textures
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    Yuv(std::sync::Arc<crate::YuvFrame>),
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 impl From<CFRetained<CVPixelBuffer>> for SurfaceSource {
     fn from(value: CFRetained<CVPixelBuffer>) -> Self {
         SurfaceSource::Surface(value)
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+impl From<std::sync::Arc<crate::YuvFrame>> for SurfaceSource {
+    fn from(value: std::sync::Arc<crate::YuvFrame>) -> Self {
+        SurfaceSource::Yuv(value)
     }
 }
 
@@ -31,7 +41,6 @@ pub struct Surface {
 }
 
 /// Create a new surface element.
-#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub fn surface(source: impl Into<SurfaceSource>) -> Surface {
     Surface {
         source: source.into(),
@@ -112,6 +121,15 @@ impl Element for Surface {
                 let new_bounds = self.object_fit.get_bounds(bounds, size);
                 // TODO: Add support for corner_radii
                 window.paint_surface(new_bounds, surface.clone());
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            SurfaceSource::Yuv(frame) => {
+                let size = crate::size(
+                    crate::DevicePixels::from(frame.width),
+                    crate::DevicePixels::from(frame.height),
+                );
+                let new_bounds = self.object_fit.get_bounds(bounds, size);
+                window.paint_surface(new_bounds, frame.clone());
             }
             #[allow(unreachable_patterns)]
             _ => {}

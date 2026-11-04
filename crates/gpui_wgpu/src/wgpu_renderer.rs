@@ -3,8 +3,8 @@ use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
-    ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, PaintSurface, Path, Point,
+    PrimitiveBatch, ScaledPixels, Scene, Size, SurfaceImage, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -84,6 +84,7 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 struct SurfaceParams {
     bounds: PodBounds,
     content_mask: PodBounds,
+    ycbcr_to_rgb: [f32; 16],
 }
 
 #[repr(C)]
@@ -185,6 +186,7 @@ struct WgpuResources {
     pipelines: WgpuPipelines,
     bind_group_layouts: WgpuBindGroupLayouts,
     atlas_sampler: wgpu::Sampler,
+    surface_sampler: wgpu::Sampler,
     atlas_texture_bind_groups: FxHashMap<AtlasTextureId, CachedTextureBindGroup>,
     globals_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
@@ -225,6 +227,14 @@ struct WgpuRendererCore {
     adapter_info: wgpu::AdapterInfo,
     target_format: wgpu::TextureFormat,
     max_texture_size: u32,
+    surface_textures: FxHashMap<(u32, u32, u32), SurfaceTextures>,
+}
+
+struct SurfaceTextures {
+    _luma: wgpu::Texture,
+    luma_view: wgpu::TextureView,
+    _chroma: wgpu::Texture,
+    chroma_view: wgpu::TextureView,
 }
 
 /// GPU resources of a windowed renderer. A surface is only ever configured against the
@@ -1265,6 +1275,14 @@ impl WgpuRendererCore {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        let surface_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("surface_sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
         let uniform_alignment = device.limits().min_uniform_buffer_offset_alignment as u64;
         let globals_size = std::mem::size_of::<GlobalParams>() as u64;
         let gamma_size = std::mem::size_of::<GammaParams>() as u64;
@@ -1368,6 +1386,7 @@ impl WgpuRendererCore {
                 pipelines,
                 bind_group_layouts,
                 atlas_sampler,
+                surface_sampler,
                 atlas_texture_bind_groups: FxHashMap::default(),
                 globals_buffer,
                 globals_bind_group,
@@ -1391,6 +1410,7 @@ impl WgpuRendererCore {
             adapter_info: context.adapter.get_info(),
             target_format,
             max_texture_size,
+            surface_textures: FxHashMap::default(),
         }
     }
 
@@ -1633,9 +1653,9 @@ impl WgpuRendererCore {
                             &mut pass,
                         )?;
                     }
-                    // Surfaces are macOS-only for video playback and are not
-                    // implemented by the WGPU renderer.
-                    PrimitiveBatch::Surfaces(_surfaces) => {}
+                    PrimitiveBatch::Surfaces(range) => {
+                        self.draw_surfaces(&scene.surfaces[range], &mut pass)?;
+                    }
                 }
             }
         }
@@ -1802,6 +1822,168 @@ impl WgpuRendererCore {
                 ..sprite_instances.first_instance + range.end,
         );
         Ok(())
+    }
+
+    fn draw_surfaces(
+        &mut self,
+        surfaces: &[PaintSurface],
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> Result<()> {
+        for (index, surface) in surfaces.iter().enumerate() {
+            let SurfaceImage::Yuv(frame) = &surface.image;
+            if !frame.is_valid() {
+                continue;
+            }
+            let (chroma_width, chroma_height) = frame.chroma_size();
+            let key = (frame.width, frame.height, index as u32);
+            self.ensure_surface_textures(
+                key,
+                frame.width,
+                frame.height,
+                chroma_width,
+                chroma_height,
+            );
+            let resources = self.resources();
+            let Some(textures) = self.surface_textures.get(&key) else {
+                continue;
+            };
+
+            resources.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &textures._luma,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &frame.y_plane,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(frame.y_stride),
+                    rows_per_image: Some(frame.height),
+                },
+                wgpu::Extent3d {
+                    width: frame.width,
+                    height: frame.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            resources.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &textures._chroma,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &frame.uv_plane,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(frame.uv_stride),
+                    rows_per_image: Some(chroma_height),
+                },
+                wgpu::Extent3d {
+                    width: chroma_width,
+                    height: chroma_height,
+                    depth_or_array_layers: 1,
+                },
+            );
+
+            let params = SurfaceParams {
+                bounds: surface.bounds.into(),
+                content_mask: surface.content_mask.bounds.into(),
+                ycbcr_to_rgb: bytemuck::cast(frame.color_space.matrix()),
+            };
+            let uniform = resources.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("surface_uniform"),
+                size: std::mem::size_of::<SurfaceParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            resources
+                .queue
+                .write_buffer(&uniform, 0, bytemuck::bytes_of(&params));
+
+            let bind_group = resources
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("surface_bind_group"),
+                    layout: &resources.bind_group_layouts.surfaces,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: uniform.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&textures.luma_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(&textures.chroma_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::Sampler(&resources.surface_sampler),
+                        },
+                    ],
+                });
+
+            pass.set_pipeline(&resources.pipelines.surfaces);
+            pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+            pass.set_bind_group(1, &bind_group, &[]);
+            pass.draw(0..4, 0..1);
+        }
+        Ok(())
+    }
+
+    fn ensure_surface_textures(
+        &mut self,
+        key: (u32, u32, u32),
+        width: u32,
+        height: u32,
+        chroma_width: u32,
+        chroma_height: u32,
+    ) {
+        if self.surface_textures.contains_key(&key) {
+            return;
+        }
+        if self.surface_textures.len() >= 4 {
+            self.surface_textures.clear();
+        }
+        let device = self.resources.device.clone();
+        let create = |label: &str, width: u32, height: u32, format: wgpu::TextureFormat| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            })
+        };
+        let luma = create("surface_luma", width, height, wgpu::TextureFormat::R8Unorm);
+        let chroma = create(
+            "surface_chroma",
+            chroma_width,
+            chroma_height,
+            wgpu::TextureFormat::Rg8Unorm,
+        );
+        let luma_view = luma.create_view(&wgpu::TextureViewDescriptor::default());
+        let chroma_view = chroma.create_view(&wgpu::TextureViewDescriptor::default());
+        self.surface_textures.insert(
+            key,
+            SurfaceTextures {
+                _luma: luma,
+                luma_view,
+                _chroma: chroma,
+                chroma_view,
+            },
+        );
     }
 
     unsafe fn instance_bytes<T>(instances: &[T]) -> &[u8] {

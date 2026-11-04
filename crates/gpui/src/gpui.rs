@@ -63,6 +63,7 @@ mod virtual_file;
 #[cfg(test)]
 mod virtual_file_tests;
 mod window;
+mod yuv;
 
 #[cfg(feature = "profiler")]
 mod debug_overlay;
@@ -159,6 +160,7 @@ pub use virtual_file::{
     VirtualFileProvider, VirtualFileStream, VirtualFileTreeProvider,
 };
 pub use window::*;
+pub use yuv::*;
 
 #[cfg(not(target_family = "wasm"))]
 pub use pollster::block_on;
